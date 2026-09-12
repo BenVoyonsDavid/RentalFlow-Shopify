@@ -1,34 +1,228 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// RentalFlow Shopify data model
+// The Session model is required by Shopify's Prisma session storage.
 
 generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
   provider = "sqlite"
   url      = "file:dev.sqlite"
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+model ShopSettings {
+  id        String   @id @default(cuid())
+  shop      String   @unique
+  plan      String   @default("BASIC")
+  language  String   @default("AUTO")
+  currency  String   @default("CAD")
+  timezone  String   @default("America/Toronto")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Asset {
+  id                    String   @id @default(cuid())
+  shop                  String
+  shopifyProductId      String?
+  shopifyVariantId      String?
+  assetNumber           String
+  title                 String
+  productType           String?
+  status                String   @default("AVAILABLE")
+  dailyRateCents        Int      @default(0)
+  weeklyRateCents       Int?
+  monthlyRateCents      Int?
+  discountAfterDays     Int?
+  discountPercent       Float?
+  currency              String   @default("CAD")
+  serialNumber          String?
+  imageUrl              String?
+  notes                 String?
+  active                Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  reservationItems      ReservationItem[]
+  bookingLocks          BookingLock[]
+
+  @@unique([shop, assetNumber])
+  @@index([shop, active, status])
+  @@index([shop, shopifyProductId])
+}
+
+model Customer {
+  id                  String        @id @default(cuid())
+  shop                String
+  shopifyCustomerId   String?
+  customerNumber      String
+  firstName           String?
+  lastName            String?
+  companyName         String?
+  email               String?
+  phone               String?
+  addressLine1        String?
+  addressLine2        String?
+  city                String?
+  region              String?
+  postalCode          String?
+  country             String?
+  discountPercent     Float         @default(0)
+  notes               String?
+  active              Boolean       @default(true)
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  reservations        Reservation[]
+
+  @@unique([shop, customerNumber])
+  @@index([shop, active])
+  @@index([shop, email])
+  @@index([shop, shopifyCustomerId])
+}
+
+model Reservation {
+  id                      String            @id @default(cuid())
+  shop                    String
+  reservationNumber       String
+  customerId              String
+  customerName            String
+  customerEmail           String?
+  customerPhone           String?
+  startDateTime           DateTime
+  endDateTime             DateTime
+  bufferBeforeHours       Int               @default(0)
+  bufferAfterHours        Int               @default(0)
+  status                  String            @default("CONFIRMED")
+  workflowStage           String            @default("RESERVATION")
+  subtotalCents           Int               @default(0)
+  customerDiscountPercent Float             @default(0)
+  discountCents           Int               @default(0)
+  preTaxTotalCents        Int               @default(0)
+  tax1Name                String?
+  tax1Rate                Float             @default(0)
+  tax1Cents               Int               @default(0)
+  tax2Name                String?
+  tax2Rate                Float             @default(0)
+  tax2Cents               Int               @default(0)
+  taxTotalCents           Int               @default(0)
+  totalCents              Int               @default(0)
+  currency                String            @default("CAD")
+  depositRequired         Boolean           @default(false)
+  depositType             String?
+  depositValue            Float?
+  depositAmountCents      Int               @default(0)
+  amountDueNowCents       Int               @default(0)
+  balanceDueCents         Int               @default(0)
+  paymentMode             String?
+  checkoutDateTime        DateTime?
+  returnDateTime          DateTime?
+  closedDateTime          DateTime?
+  notes                   String?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+  customer                Customer          @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  items                   ReservationItem[]
+  payments                Payment[]
+  activity                ActivityEntry[]
+
+  @@unique([shop, reservationNumber])
+  @@index([shop, startDateTime, status])
+  @@index([shop, customerId, startDateTime])
+}
+
+model ReservationItem {
+  id                   String      @id @default(cuid())
+  shop                 String
+  reservationId        String
+  assetId              String
+  assetNumber          String
+  assetTitle           String
+  startDateTime        DateTime
+  endDateTime          DateTime
+  blockedStartDateTime DateTime
+  blockedEndDateTime   DateTime
+  bufferBeforeHours    Int         @default(0)
+  bufferAfterHours     Int         @default(0)
+  billableDays         Int         @default(1)
+  lineTotalCents       Int         @default(0)
+  pricingMode          String      @default("DAILY")
+  currency             String      @default("CAD")
+  status               String      @default("CONFIRMED")
+  createdAt            DateTime    @default(now())
+  updatedAt            DateTime    @updatedAt
+  reservation          Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  asset                Asset       @relation(fields: [assetId], references: [id], onDelete: Restrict)
+
+  @@unique([reservationId, assetId])
+  @@index([shop, assetId, blockedStartDateTime, blockedEndDateTime])
+  @@index([shop, reservationId])
+}
+
+model Payment {
+  id                    String      @id @default(cuid())
+  shop                  String
+  reservationId         String
+  paymentNumber         String
+  paymentType           String
+  method                String
+  status                String      @default("PENDING")
+  amountCents           Int         @default(0)
+  currency              String      @default("CAD")
+  paymentDate           DateTime?
+  reference             String?
+  shopifyOrderId        String?
+  shopifyTransactionId  String?
+  remainingBalanceCents Int         @default(0)
+  notes                 String?
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+  reservation           Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@unique([shop, paymentNumber])
+  @@index([shop, reservationId, paymentDate])
+  @@index([shop, shopifyOrderId])
+}
+
+model BookingLock {
+  id        String   @id @default(cuid())
+  shop      String
+  assetId   String
+  lockToken String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  asset     Asset    @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([shop, assetId])
+  @@index([expiresAt])
+}
+
+model ActivityEntry {
+  id            String      @id @default(cuid())
+  shop          String
+  reservationId String
+  action        String
+  description   String
+  eventDate     DateTime    @default(now())
+  reservation   Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@index([shop, reservationId, eventDate])
 }
