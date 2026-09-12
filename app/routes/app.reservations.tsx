@@ -72,6 +72,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       include: {
         items: {
           select: {
+            assetId: true,
             assetNumber: true,
             assetTitle: true,
           },
@@ -105,12 +106,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     reservations: reservations.map((reservation) => ({
       id: reservation.id,
       reservationNumber: reservation.reservationNumber,
+      customerId: reservation.customerId,
       customerName: reservation.customerName,
       startDateTime: reservation.startDateTime.toISOString(),
       endDateTime: reservation.endDateTime.toISOString(),
+      bufferBeforeHours: reservation.bufferBeforeHours,
+      bufferAfterHours: reservation.bufferAfterHours,
       status: reservation.status,
       totalCents: reservation.totalCents,
       currency: reservation.currency,
+      notes: reservation.notes || "",
+      assetIds: reservation.items.map((item) => item.assetId),
       assets: reservation.items.map((item) => `${item.assetNumber} · ${item.assetTitle}`),
     })),
   };
@@ -122,10 +128,66 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const intent = textValue(formData.get("intent"));
 
-  if (intent !== "create") {
+  if (intent === "cancel") {
+    const reservationId = textValue(formData.get("reservationId"));
+    if (!reservationId) return { ok: false, error: "Reservation not found." };
+
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const reservation = await tx.reservation.findFirst({
+          where: { id: reservationId, shop },
+          select: { id: true, reservationNumber: true, status: true },
+        });
+
+        if (!reservation) throw new Error("RESERVATION_NOT_FOUND");
+        if (reservation.status === "CANCELLED") {
+          return { reservationNumber: reservation.reservationNumber, alreadyCancelled: true };
+        }
+
+        await tx.reservation.update({
+          where: { id: reservation.id },
+          data: {
+            status: "CANCELLED",
+            items: {
+              updateMany: {
+                where: {},
+                data: { status: "CANCELLED" },
+              },
+            },
+            activity: {
+              create: {
+                shop,
+                action: "RESERVATION_CANCELLED",
+                description: `Reservation ${reservation.reservationNumber} cancelled.`,
+              },
+            },
+          },
+        });
+
+        return { reservationNumber: reservation.reservationNumber, alreadyCancelled: false };
+      });
+
+      return {
+        ok: true,
+        message: result.alreadyCancelled
+          ? `${result.reservationNumber} was already cancelled.`
+          : `${result.reservationNumber} was cancelled and its equipment is available again.`,
+      };
+    } catch (error) {
+      console.error("Reservation cancellation failed", error);
+      const message = error instanceof Error ? error.message : "";
+      if (message === "RESERVATION_NOT_FOUND") {
+        return { ok: false, error: "The reservation could not be found." };
+      }
+      return { ok: false, error: "Could not cancel the reservation. Please try again." };
+    }
+  }
+
+  if (intent !== "create" && intent !== "update") {
     return { ok: false, error: "Unknown reservation action." };
   }
 
+  const reservationId = textValue(formData.get("reservationId"));
   const customerId = textValue(formData.get("customerId"));
   const assetIds = Array.from(
     new Set(formData.getAll("assetIds").map((value) => textValue(value)).filter(Boolean)),
@@ -136,6 +198,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const bufferAfterHours = parseNonNegativeInt(formData.get("bufferAfterHours"));
   const notes = textValue(formData.get("notes")) || null;
 
+  if (intent === "update" && !reservationId) {
+    return { ok: false, error: "Reservation not found." };
+  }
   if (!customerId) return { ok: false, error: "Select a customer." };
   if (assetIds.length === 0) return { ok: false, error: "Select at least one piece of equipment." };
   if (!startDateTime || !endDateTime) return { ok: false, error: "Enter valid start and end dates." };
@@ -161,6 +226,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         where: { id: customerId, shop, active: true },
       });
       if (!customer) throw new Error("CUSTOMER_NOT_FOUND");
+
+      const currentReservation =
+        intent === "update"
+          ? await tx.reservation.findFirst({
+              where: { id: reservationId, shop },
+              select: {
+                id: true,
+                reservationNumber: true,
+                status: true,
+              },
+            })
+          : null;
+
+      if (intent === "update" && !currentReservation) {
+        throw new Error("RESERVATION_NOT_FOUND");
+      }
+      if (currentReservation?.status === "CANCELLED") {
+        throw new Error("RESERVATION_CANCELLED");
+      }
 
       const assets = await tx.asset.findMany({
         where: {
@@ -203,10 +287,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           status: { not: "CANCELLED" },
           blockedStartDateTime: { lt: blockedEndDateTime },
           blockedEndDateTime: { gt: blockedStartDateTime },
+          ...(intent === "update" ? { reservationId: { not: reservationId } } : {}),
         },
         select: {
           assetNumber: true,
-          assetTitle: true,
           reservation: {
             select: { reservationNumber: true },
           },
@@ -231,81 +315,126 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const discountCents = Math.round(subtotalCents * (customerDiscountPercent / 100));
       const preTaxTotalCents = Math.max(0, subtotalCents - discountCents);
       const totalCents = preTaxTotalCents;
-      const number = reservationNumber();
       const customerName = customerDisplayName(customer);
 
-      const reservation = await tx.reservation.create({
-        data: {
-          shop,
-          reservationNumber: number,
-          customerId: customer.id,
-          customerName,
-          customerEmail: customer.email,
-          customerPhone: customer.phone,
-          startDateTime,
-          endDateTime,
-          bufferBeforeHours,
-          bufferAfterHours,
-          status: "CONFIRMED",
-          workflowStage: "RESERVATION",
-          subtotalCents,
-          customerDiscountPercent,
-          discountCents,
-          preTaxTotalCents,
-          tax1Rate: 0,
-          tax1Cents: 0,
-          tax2Rate: 0,
-          tax2Cents: 0,
-          taxTotalCents: 0,
-          totalCents,
-          currency: settings.currency,
-          amountDueNowCents: 0,
-          balanceDueCents: totalCents,
-          notes,
-          items: {
-            create: assets.map((asset) => ({
-              shop,
-              assetId: asset.id,
-              assetNumber: asset.assetNumber,
-              assetTitle: asset.title,
-              startDateTime,
-              endDateTime,
-              blockedStartDateTime,
-              blockedEndDateTime,
-              bufferBeforeHours,
-              bufferAfterHours,
-              billableDays: days,
-              lineTotalCents: asset.dailyRateCents * days,
-              pricingMode: "DAILY",
-              currency: settings.currency,
-              status: "CONFIRMED",
-            })),
-          },
-          activity: {
-            create: {
-              shop,
-              action: "RESERVATION_CREATED",
-              description: `Reservation ${number} created for ${customerName}.`,
+      const itemData = assets.map((asset) => ({
+        shop,
+        assetId: asset.id,
+        assetNumber: asset.assetNumber,
+        assetTitle: asset.title,
+        startDateTime,
+        endDateTime,
+        blockedStartDateTime,
+        blockedEndDateTime,
+        bufferBeforeHours,
+        bufferAfterHours,
+        billableDays: days,
+        lineTotalCents: asset.dailyRateCents * days,
+        pricingMode: "DAILY",
+        currency: settings.currency,
+        status: currentReservation?.status || "CONFIRMED",
+      }));
+
+      let savedReservation;
+
+      if (intent === "create") {
+        const number = reservationNumber();
+        savedReservation = await tx.reservation.create({
+          data: {
+            shop,
+            reservationNumber: number,
+            customerId: customer.id,
+            customerName,
+            customerEmail: customer.email,
+            customerPhone: customer.phone,
+            startDateTime,
+            endDateTime,
+            bufferBeforeHours,
+            bufferAfterHours,
+            status: "CONFIRMED",
+            workflowStage: "RESERVATION",
+            subtotalCents,
+            customerDiscountPercent,
+            discountCents,
+            preTaxTotalCents,
+            tax1Rate: 0,
+            tax1Cents: 0,
+            tax2Rate: 0,
+            tax2Cents: 0,
+            taxTotalCents: 0,
+            totalCents,
+            currency: settings.currency,
+            amountDueNowCents: 0,
+            balanceDueCents: totalCents,
+            notes,
+            items: { create: itemData },
+            activity: {
+              create: {
+                shop,
+                action: "RESERVATION_CREATED",
+                description: `Reservation ${number} created for ${customerName}.`,
+              },
             },
           },
-        },
-      });
+        });
+      } else {
+        savedReservation = await tx.reservation.update({
+          where: { id: currentReservation!.id },
+          data: {
+            customerId: customer.id,
+            customerName,
+            customerEmail: customer.email,
+            customerPhone: customer.phone,
+            startDateTime,
+            endDateTime,
+            bufferBeforeHours,
+            bufferAfterHours,
+            subtotalCents,
+            customerDiscountPercent,
+            discountCents,
+            preTaxTotalCents,
+            tax1Rate: 0,
+            tax1Cents: 0,
+            tax2Rate: 0,
+            tax2Cents: 0,
+            taxTotalCents: 0,
+            totalCents,
+            currency: settings.currency,
+            balanceDueCents: totalCents,
+            notes,
+            items: {
+              deleteMany: {},
+              create: itemData,
+            },
+            activity: {
+              create: {
+                shop,
+                action: "RESERVATION_UPDATED",
+                description: `Reservation ${currentReservation!.reservationNumber} updated.`,
+              },
+            },
+          },
+        });
+      }
 
       await tx.bookingLock.deleteMany({ where: { shop, lockToken } });
 
       return {
-        reservationNumber: reservation.reservationNumber,
-        totalCents: reservation.totalCents,
-        currency: reservation.currency,
+        reservationNumber: savedReservation.reservationNumber,
+        totalCents: savedReservation.totalCents,
+        currency: savedReservation.currency,
       };
     });
 
     return {
       ok: true,
-      message: `${result.reservationNumber} was created for ${money(result.totalCents, result.currency)}.`,
+      message:
+        intent === "create"
+          ? `${result.reservationNumber} was created for ${money(result.totalCents, result.currency)}.`
+          : `${result.reservationNumber} was updated. New total: ${money(result.totalCents, result.currency)}.`,
     };
   } catch (error) {
-    console.error("Reservation creation failed", error);
+    console.error(`Reservation ${intent} failed`, error);
     const message = error instanceof Error ? error.message : "";
 
     if (message === "CUSTOMER_NOT_FOUND") {
@@ -313,6 +442,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
     if (message === "ASSET_NOT_FOUND") {
       return { ok: false, error: "One or more selected assets are no longer available." };
+    }
+    if (message === "RESERVATION_NOT_FOUND") {
+      return { ok: false, error: "The reservation could not be found." };
+    }
+    if (message === "RESERVATION_CANCELLED") {
+      return { ok: false, error: "A cancelled reservation cannot be edited." };
     }
     if (message.startsWith("LOCKED:")) {
       return {
@@ -327,7 +462,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       };
     }
 
-    return { ok: false, error: "Could not create the reservation. Please try again." };
+    return {
+      ok: false,
+      error: intent === "update" ? "Could not update the reservation. Please try again." : "Could not create the reservation. Please try again.",
+    };
   }
 };
 
@@ -336,6 +474,12 @@ function dateTime(value: string) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+}
+
+function dateTimeInput(value: string) {
+  const date = new Date(value);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
 }
 
 function money(cents: number, currency: string) {
@@ -369,6 +513,12 @@ const buttonStyle = {
   cursor: "pointer",
 };
 
+const dangerButtonStyle = {
+  ...buttonStyle,
+  borderColor: "#d82c0d",
+  color: "#d82c0d",
+};
+
 export default function ReservationsPage() {
   const { settings, customers, assets, reservations } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
@@ -378,13 +528,13 @@ export default function ReservationsPage() {
   return (
     <s-page heading="Reservations">
       {actionData?.ok === false && (
-        <s-section heading="Could not create reservation">
+        <s-section heading="Reservation action failed">
           <s-paragraph>{actionData.error}</s-paragraph>
         </s-section>
       )}
 
       {actionData?.ok === true && (
-        <s-section heading="Reservation created">
+        <s-section heading="Reservation updated">
           <s-paragraph>{actionData.message}</s-paragraph>
         </s-section>
       )}
@@ -485,11 +635,12 @@ export default function ReservationsPage() {
                   <th style={{ textAlign: "left", padding: 10 }}>End</th>
                   <th style={{ textAlign: "left", padding: 10 }}>Status</th>
                   <th style={{ textAlign: "right", padding: 10 }}>Total</th>
+                  <th style={{ textAlign: "left", padding: 10 }}>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {reservations.map((reservation) => (
-                  <tr key={reservation.id} style={{ borderTop: "1px solid #e3e3e3" }}>
+                  <tr key={reservation.id} style={{ borderTop: "1px solid #e3e3e3", verticalAlign: "top" }}>
                     <td style={{ padding: 10 }}>{reservation.reservationNumber}</td>
                     <td style={{ padding: 10 }}>{reservation.customerName}</td>
                     <td style={{ padding: 10 }}>{reservation.assets.join(", ")}</td>
@@ -498,6 +649,116 @@ export default function ReservationsPage() {
                     <td style={{ padding: 10 }}>{reservation.status}</td>
                     <td style={{ padding: 10, textAlign: "right" }}>
                       {money(reservation.totalCents, reservation.currency)}
+                    </td>
+                    <td style={{ padding: 10, minWidth: 280 }}>
+                      {reservation.status === "CANCELLED" ? (
+                        <span>Cancelled</span>
+                      ) : (
+                        <div style={{ display: "grid", gap: 8 }}>
+                          <details>
+                            <summary style={{ cursor: "pointer", fontWeight: 600 }}>Edit reservation</summary>
+                            <Form method="post" style={{ display: "grid", gap: 8, marginTop: 10 }}>
+                              <input type="hidden" name="intent" value="update" />
+                              <input type="hidden" name="reservationId" value={reservation.id} />
+
+                              <label style={labelStyle}>
+                                Customer
+                                <select name="customerId" required defaultValue={reservation.customerId} style={inputStyle}>
+                                  {customers.map((customer) => (
+                                    <option key={customer.id} value={customer.id}>
+                                      {customer.customerNumber} · {customer.displayName}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+
+                              <label style={labelStyle}>
+                                Start
+                                <input
+                                  name="startDateTime"
+                                  type="datetime-local"
+                                  required
+                                  defaultValue={dateTimeInput(reservation.startDateTime)}
+                                  style={inputStyle}
+                                />
+                              </label>
+
+                              <label style={labelStyle}>
+                                End
+                                <input
+                                  name="endDateTime"
+                                  type="datetime-local"
+                                  required
+                                  defaultValue={dateTimeInput(reservation.endDateTime)}
+                                  style={inputStyle}
+                                />
+                              </label>
+
+                              <label style={labelStyle}>
+                                Buffer before (hours)
+                                <input
+                                  name="bufferBeforeHours"
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  defaultValue={reservation.bufferBeforeHours}
+                                  style={inputStyle}
+                                />
+                              </label>
+
+                              <label style={labelStyle}>
+                                Buffer after (hours)
+                                <input
+                                  name="bufferAfterHours"
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  defaultValue={reservation.bufferAfterHours}
+                                  style={inputStyle}
+                                />
+                              </label>
+
+                              <label style={labelStyle}>
+                                Equipment
+                                <select
+                                  name="assetIds"
+                                  multiple
+                                  required
+                                  defaultValue={reservation.assetIds}
+                                  size={Math.min(Math.max(assets.length, 4), 8)}
+                                  style={inputStyle}
+                                >
+                                  {assets.map((asset) => (
+                                    <option key={asset.id} value={asset.id}>
+                                      {asset.assetNumber} · {asset.title} · {money(asset.dailyRateCents, asset.currency)}/day
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+
+                              <label style={labelStyle}>
+                                Notes
+                                <textarea name="notes" rows={3} defaultValue={reservation.notes} style={inputStyle} />
+                              </label>
+
+                              <button type="submit" style={buttonStyle}>Save changes</button>
+                            </Form>
+                          </details>
+
+                          <Form
+                            method="post"
+                            onSubmit={(event) => {
+                              if (!window.confirm(`Cancel ${reservation.reservationNumber}?`)) {
+                                event.preventDefault();
+                              }
+                            }}
+                          >
+                            <input type="hidden" name="intent" value="cancel" />
+                            <input type="hidden" name="reservationId" value={reservation.id} />
+                            <button type="submit" style={dangerButtonStyle}>Cancel reservation</button>
+                          </Form>
+                        </div>
+                      )}
                     </td>
                   </tr>
                 ))}
